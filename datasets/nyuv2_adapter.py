@@ -7,14 +7,8 @@ import torch
 import torch.utils.data as data
 from torchvision import transforms
 
-# Copying minimal necessary augmentations to avoid dependency hell if possible, 
-# or import from TUNI if in path. 
-# We will assume TUNI is in path or we copy what we need. 
-# For simplicity, let's use standard torchvision transforms or assume `toolbox` is importable.
-# The user workspace has TUNI/toolbox.
-import sys
-sys.path.append("/home/yy/deepsemanticseg-test/TUNI")
-from toolbox.datasets.augmentations import Resize, Compose, ColorJitter, RandomHorizontalFlip, RandomCrop, RandomScale, RandomRotation
+# Local imports to ensure independence
+from .augmentations import Resize, Compose, ColorJitter, RandomHorizontalFlip, RandomCrop, RandomScale, RandomRotation
 
 class NYUv2Hyd(data.Dataset):
     def __init__(self, cfg, mode='train', do_aug=True):
