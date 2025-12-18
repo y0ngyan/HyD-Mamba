@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs
+.idea/
+.vscode/
+
+# Datasets
+database/
+nyu_depth_v2_labeled.mat
+
+# Checkpoints & Logs
+checkpoints/
+*.pth
+*.tar
+work_dirs/
+outputs/
+*.log
+
+# System
+.DS_Store

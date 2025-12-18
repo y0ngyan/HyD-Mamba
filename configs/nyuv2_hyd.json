@@ -1,0 +1,19 @@
+{
+    "model_name": "hyd_mamba_nyuv2",
+    "inputs": "rgbd",
+    "dataset": "nyuv2",
+    "root": "/home/yy/deepsemanticseg-test/database/nyuv2",
+    "n_classes": 41,
+    "id_unlabel": 0,
+    "class_weight": "enet",
+    "scales_range": "0.5 2.0",
+    "crop_size": "480 640",
+    "ims_per_gpu": 2,
+    "num_workers": 2,
+    "lr_start": 5e-4,
+    "momentum": 0.9,
+    "weight_decay": 0.01,
+    "lr_power": 0.9,
+    "epochs": 500,
+    "loss": "detail_aggregate"
+}
