@@ -59,7 +59,7 @@ def train(cfg_path):
     for epoch in range(cfg['epochs']):
         model.train()
         epoch_loss = 0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['epochs']}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['epochs']}", dynamic_ncols=True, file=sys.stdout)
         
         for batch in pbar:
             images = batch['image'].to(device)
@@ -81,7 +81,7 @@ def train(cfg_path):
             optimizer.step()
             
             epoch_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
             
         scheduler.step()
         avg_loss = epoch_loss / len(train_loader)
@@ -106,7 +106,7 @@ def validate(model, loader, device, num_classes):
     union = torch.zeros(num_classes).to(device)
     
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Validating"):
+        for batch in tqdm(loader, desc="Validating", dynamic_ncols=True, file=sys.stdout):
             images = batch['image'].to(device)
             depths = batch['depth'].to(device)
             labels = batch['label'].to(device)
