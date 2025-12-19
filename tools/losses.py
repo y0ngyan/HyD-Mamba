@@ -26,12 +26,29 @@ class OhemCrossEntropyLoss(nn.Module):
         tmp_target[tmp_target == self.ignore_index] = 0
         pred = F.softmax(pred, dim=1)
         pred = pred.gather(1, tmp_target.unsqueeze(1))
-        pred, ind = pred.contiguous().view(-1,)[mask].sort()
-        min_value = pred[min(self.min_kept, pred.numel() - 1)]
-        threshold = max(min_value, self.thresh)
+        if not mask.any():
+            return pixel_losses.new_zeros(1, requires_grad=True).mean()
+
+        pixel_losses = pixel_losses[mask]
+        pred = pred.contiguous().view(-1,)[mask]
         
-        pixel_losses = pixel_losses[mask][ind]
+        # Sort and pick threshold
+        pred, ind = pred.sort()
+        
+        num_kept = min(self.min_kept, pred.numel())
+        if num_kept > 0:
+            min_value = pred[num_kept - 1]
+            threshold = max(min_value, self.thresh)
+        else:
+            threshold = self.thresh
+
+        pixel_losses = pixel_losses[ind]
         pixel_losses = pixel_losses[pred < threshold]
+        
+        if pixel_losses.numel() == 0:
+            # Fallback if no pixels match (e.g. all pixels are correct)
+            return pred.new_zeros(1, requires_grad=True).mean()
+            
         return pixel_losses.mean()
 
 class DetailAggregateLoss(nn.Module):

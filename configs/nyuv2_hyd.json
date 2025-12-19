@@ -16,5 +16,6 @@
     "weight_decay": 0.01,
     "lr_power": 0.9,
     "epochs": 500,
+    "freeze_backbone_epochs": 5,
     "loss": "detail_aggregate"
 }

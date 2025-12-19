@@ -15,34 +15,65 @@ class HyDNet(nn.Module):
     def __init__(self, num_classes=19, pretrained=None):
         super().__init__()
         
-        # 1. Encoder (V2 Lightweight)
-        # Reduced channels: [32, 64, 128, 256] for ~5M params
-        self.dims = [32, 64, 128, 256]
+        # 1. Encoder (V2.2 Grafted Architecture)
+        self.dims = [16, 24, 128, 256]
         self.encoder = HyDEncoder(
             in_chans=3, 
             embed_dims=self.dims,
             drop_path_rate=0.2
         )
         
-        # 2. Decoder
-        # Encoder outputs: Stage1 (dim[1]=64), Stage2 (dim[2]=128), Stage3 (dim[3]=256), Stage4 (dim[3]=256)
-        encoder_out_channels = [self.dims[1], self.dims[2], self.dims[3], self.dims[3]]
+        # 2. Decoder (FPN Upgrade)
         self.decoder = HyDHead(
-            in_channels_list=encoder_out_channels,
-            embedding_dim=64,  # Reduced from 128
+            in_channels_list=self.dims,
+            embedding_dim=64,
             num_classes=num_classes
         )
         
+        # 3. Auxiliary Head (Stage 3 - 1/16 scale)
+        if num_classes > 0:
+            self.aux_head = nn.Sequential(
+                nn.Conv2d(self.dims[2], self.dims[2], 3, padding=1, bias=False),
+                nn.BatchNorm2d(self.dims[2]),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+                nn.Conv2d(self.dims[2], num_classes, 1)
+            )
+        else:
+            self.aux_head = None
+            
+        # 4. Initialization
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
     def forward(self, rgb, depth):
         # 1. Encode
-        features = self.encoder(rgb, depth)
+        features = self.encoder(rgb, depth) # [P1, P2, P3, P4]
         
-        # 2. Decode with Depth-guided DuSA
+        # 2. Decode with FPN + DuSA
         logits = self.decoder(features, depth=depth)
         
-        # 3. Upsample to input size
+        # 3. Upsample main output
         out = F.interpolate(logits, size=rgb.shape[-2:], mode='bilinear', align_corners=False)
         
+        if self.training and self.aux_head is not None:
+            # Auxiliary output from Stage 3 (1/16 scale)
+            aux_logits = self.aux_head(features[2])
+            aux_out = F.interpolate(aux_logits, size=rgb.shape[-2:], mode='bilinear', align_corners=False)
+            return out, aux_out
+            
         return out
 
 if __name__ == "__main__":

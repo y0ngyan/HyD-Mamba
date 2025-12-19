@@ -14,7 +14,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import hyd_mamba
-from tools.losses import DetailAggregateLoss
+from tools.losses import DetailAggregateLoss, OhemCrossEntropyLoss
 
 class SyntheticRGBDDataset(Dataset):
     """
@@ -82,23 +82,49 @@ def train_synthetic():
     criterion = DetailAggregateLoss(ignore_index=255)
     
     # 4. Loop
-    epochs = 5
+    print("Test 1: OHEM Loss Robustness")
+    ohem_criterion = OhemCrossEntropyLoss(ignore_index=255)
+    epochs = 2
     for epoch in range(epochs):
         epoch_loss = 0
         for i, (rgb, depth, mask) in enumerate(dataloader):
             rgb, depth, mask = rgb.to(device), depth.to(device), mask.to(device)
-            
             optimizer.zero_grad()
             outputs = model(rgb, depth)
             
-            loss = criterion(outputs, mask, depth)
+            # Handle dual outputs
+            if isinstance(outputs, tuple):
+                main_out, aux_out = outputs
+                loss = ohem_criterion(main_out, mask) + 0.4 * ohem_criterion(aux_out, mask)
+            else:
+                loss = ohem_criterion(outputs, mask)
+                
             loss.backward()
             optimizer.step()
-            
             epoch_loss += loss.item()
+        print(f"Epoch [{epoch+1}/{epochs}] OHEM Loss: {epoch_loss / len(dataloader):.4f}")
+
+    print("Test 2: DetailAggregateLoss Convergence")
+    detail_criterion = DetailAggregateLoss(ignore_index=255)
+    for epoch in range(epochs):
+        epoch_loss = 0
+        for i, (rgb, depth, mask) in enumerate(dataloader):
+            rgb, depth, mask = rgb.to(device), depth.to(device), mask.to(device)
+            optimizer.zero_grad()
+            outputs = model(rgb, depth)
             
+            # Handle dual outputs
+            if isinstance(outputs, tuple):
+                main_out, aux_out = outputs
+                loss = detail_criterion(main_out, mask, depth) + 0.4 * detail_criterion(aux_out, mask, depth)
+            else:
+                loss = detail_criterion(outputs, mask, depth)
+                
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
         avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.4f}")
+        print(f"Epoch [{epoch+1}/{epochs}] Detail Loss: {avg_loss:.4f}")
         
     print("="*50)
     if avg_loss < 0.5:

@@ -103,7 +103,14 @@ def train(cfg_path):
     
     # 4. Model
     print(f"Initializing HyDNet (Classes: {cfg['n_classes']})...")
-    model = HyDNet(num_classes=cfg['n_classes']).to(device)
+    model = HyDNet(num_classes=cfg['n_classes'])
+    
+    # --- Weight Grafting (v2.2) ---
+    mamba_ckpt = "/home/yy/deepsemanticseg-test/pre-trained/vmamba-tiny/vssm1_tiny_0230s_ckpt_epoch_264.pth"
+    if hasattr(model.encoder, 'load_grafted_weights'):
+        model.encoder.load_grafted_weights(mamba_ckpt)
+    
+    model = model.to(device)
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -125,9 +132,13 @@ def train(cfg_path):
             return (1 - progress) ** cfg['lr_power']
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
-    # 6. Loss (OHEM for hard example mining)
-    criterion = OhemCrossEntropyLoss(thres=0.7, min_kept=10000, ignore_index=0)
-    print("Using OHEM Loss (thresh=0.7)")
+    # 6. Loss Selection (From Config)
+    if cfg.get('loss') == 'detail_aggregate':
+        criterion = DetailAggregateLoss(ignore_index=0)
+        print("Using DetailAggregateLoss (Depth-guided)")
+    else:
+        criterion = OhemCrossEntropyLoss(thres=0.7, min_kept=10000, ignore_index=0)
+        print("Using OHEM Loss (thresh=0.7)")
     
     # 7. AMP Scaler for mixed precision
     scaler = GradScaler()
@@ -157,6 +168,31 @@ def train(cfg_path):
         epoch_start = time.time()
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['epochs']}")
+        
+        # --- Handle Staged Fine-tuning (V2.2 Freeze Logic) ---
+        freeze_epochs = cfg.get('freeze_backbone_epochs', 0)
+        if epoch < freeze_epochs:
+            # Stage 1: Freeze PRE-TRAINED RGB Encoder parts
+            # Only freeze parameters that were actually grafted
+            # We keep DepthStream, MambaFusion, and and Bridge/Downsample layers trainable
+            frozen_count = 0
+            for name, param in model.encoder.named_parameters():
+                # Selective freeze: stage blocks are pre-trained (except local branches maybe? 
+                # but we usually freeze the whole pre-trained block).
+                # However, MambaFusion and depth_stream are DEFINITELY not pre-trained.
+                if 'depth_' in name or 'fuse' in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+                    frozen_count += 1
+            
+            pbar.set_description(f"Epoch {epoch+1}/{cfg['epochs']} [FREEZE {frozen_count}]")
+        else:
+            # Stage 2: Full Fine-tuning
+            for param in model.parameters():
+                param.requires_grad = True
+            pbar.set_description(f"Epoch {epoch+1}/{cfg['epochs']} [FULL]")
+
         optimizer.zero_grad()  # Zero gradients at epoch start
         
         for batch_idx, batch in enumerate(pbar):
@@ -166,12 +202,38 @@ def train(cfg_path):
             
             # Mixed Precision Forward
             with autocast():
-                outputs = model(images, depths)
+                # Model now returns (main, aux) during training
+                model_outs = model(images, depths)
                 
-                if outputs.shape[-2:] != labels.shape[-2:]:
-                    outputs = nn.functional.interpolate(outputs, size=labels.shape[-2:], mode='bilinear', align_corners=False)
+                if isinstance(model_outs, tuple):
+                    main_outs, aux_outs = model_outs
+                else:
+                    main_outs, aux_outs = model_outs, None
+                
+                # Check shapes for main
+                if main_outs.shape[-2:] != labels.shape[-2:]:
+                    main_outs = nn.functional.interpolate(main_outs, size=labels.shape[-2:], mode='bilinear', align_corners=False)
+                
+                # Main Loss
+                if cfg.get('loss') == 'detail_aggregate':
+                    main_loss = criterion(main_outs, labels, depths)
+                else:
+                    main_loss = criterion(main_outs, labels)
+                
+                # Auxiliary Loss (if exists)
+                if aux_outs is not None:
+                    if aux_outs.shape[-2:] != labels.shape[-2:]:
+                        aux_outs = nn.functional.interpolate(aux_outs, size=labels.shape[-2:], mode='bilinear', align_corners=False)
                     
-                loss = criterion(outputs, labels)
+                    if cfg.get('loss') == 'detail_aggregate':
+                        aux_loss = criterion(aux_outs, labels, depths)
+                    else:
+                        aux_loss = criterion(aux_outs, labels)
+                    
+                    loss = main_loss + 0.4 * aux_loss
+                else:
+                    loss = main_loss
+                
                 loss = loss / accumulation_steps  # Scale loss for accumulation
             
             # Mixed Precision Backward (accumulate gradients)

@@ -1,100 +1,106 @@
 import numpy as np
 import os
+import json
 from PIL import Image
 from tqdm import tqdm
-import sys
 
-def get_nyu40_mapping():
-    # Standard mapping from 894 classes to 40 classes.
-    # We will use a simplified approach: assume we have the mapping array.
-    # Since I don't have the array handy in memory, I will use a placeholder identity or try to find it on the web?
-    # Actually, for the user's purpose (verification), 
-    # if I don't map, I get 894 classes.
-    # The config says 40.
-    # If I train with 40 classes on 894-label data, it will crash.
-    # Suggestion: Just use the top 40 classes or re-map.
-    # Better: I will download the mapping or use a reduced set.
+def get_standard_mapping(names):
+    """
+    Manually defined semantic mapping from 894 NYUv2 names to 40 classes.
+    Target classes (void=0, wall=1, ... otherprop=40)
+    Mapping logic: fuzzy search for keywords in order of priority.
+    """
+    nyu40 = [
+        'void', 'wall', 'floor', 'cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window',
+        'bookshelf', 'picture', 'counter', 'blinds', 'desk', 'shelves', 'curtain', 'dresser',
+        'pillow', 'mirror', 'floor_mat', 'clothes', 'ceiling', 'books', 'fridge', 'tv',
+        'paper', 'towel', 'shower_curtain', 'box', 'whiteboard', 'person', 'night_stand',
+        'toilet', 'sink', 'lamp', 'bathtub', 'bag', 'otherstructure', 'otherfurniture', 'otherprop'
+    ]
     
-    # Let's try to search online via browser for the mapping array snippet if possible?
-    # Or checking if `nyu_depth_v2_labeled.mat` handles this? No, it has 'labels' (894).
-    # Wait, usually `scipy.io.loadmat` also loads `names` or `instances`.
+    mapping = np.zeros(len(names) + 1, dtype=np.uint8)
     
-    # Alternative: Use "13 classes" mapping which is very common and easier to hardcode?
-    # Or just tell the user I need to map it.
-    
-    # I will attempt to hardcode the 13-class mapping or if the user provided TUNI code has it hidden somewhere?
-    # I checked `nyuv2.py`, it didn't have it.
-    
-    # Let's check `TUNI/toolbox/utils` locally.
-    pass
-
-# Since I cannot easily get the 894->40 mapping without external search or massive copy-paste,
-# I will implement a "Identity" mapping for now but update config to use n_classes=895?
-# That would make the model huge.
-# BETTER PLAN: Download class40 mapping or use a small script to generate random mapping for verification? No.
-# I will use a robust strategy: Download `class13_mapping.mat` or similar if I can.
-# But I can't browse freely.
-
-# Let's check TUNI again. Maybe `train.py` does something?
-# Or maybe the TUNI `nyuv2.py` EXPECTS pre-processed data from a specific repo (e.g. `fast-depth` or `ESANet` preprocessing).
-
-# DECISION: I will write a script that maps everything > 40 to 0 (unlabeled) for now, 
-# just to make the code RUNNABLE with 40 classes. 
-# This is a temporary hack for "Feasibility Verification".
-# The user wants "Verification", not SOTA accuracy immediately.
-# But 1..40 in raw labels might not be the most frequent classes.
-# The raw labels are sorted by frequency? No.
-# Actually, I'll recommend the user to use the provided `nyuv2.py` logic which likely assumes correct labels.
-# If I look at `class_weight` in `nyuv2.py` (lines 43-49), it has 40 weights.
-# This confirms the dataset class expects 40-class labels.
-
-# I will assume `nyuv2_labeled.mat` contains raw labels.
-# I will create a dummy mapping that maps Top 40 used labels to 1..40 and rest to 0.
-# This ensures we have valid data.
-    pass
-
-def map_labels(data_dir):
-    label_dir = os.path.join(data_dir, 'label')
-    out_dir = os.path.join(data_dir, 'label_40')
-    os.makedirs(out_dir, exist_ok=True)
-    
-    files = sorted(os.listdir(label_dir))
-    
-    # 1. Compute histogram to find top 40 classes if we don't know them
-    print("Computing class statistics...")
-    counts = {}
-    for f in tqdm(files[:100]): # Sample 100 for speed
-        lbl = np.array(Image.open(os.path.join(label_dir, f)))
-        u, c = np.unique(lbl, return_counts=True)
-        for val, count in zip(u, c):
-            counts[val] = counts.get(val, 0) + count
-            
-    # Sort by count
-    sorted_classes = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    # Take top 40 (excluding 0)
-    top_classes = [c[0] for c in sorted_classes if c[0] != 0][:40]
-    print(f"Top 40 classes: {top_classes}")
-    
-    # Create mapping array
-    # input 0..65535
-    # mapping: index -> new_label
-    max_val = max(counts.keys()) + 1
-    mapping = np.zeros(max_val, dtype=np.uint8)
-    for new_id, old_id in enumerate(top_classes, 1):
+    for i, name in enumerate(names):
+        old_id = i + 1  # 1-indexed in labels
+        name = name.lower().strip()
+        new_id = 40 # Default to otherprop
+        
+        # Priority mapping
+        if any(k in name for k in ['wall', 'walls']): new_id = 1
+        elif any(k in name for k in ['floor', 'flooring']): new_id = 2
+        elif any(k in name for k in ['cabinet', 'cupboard']): new_id = 3
+        elif 'bed' in name: new_id = 4
+        elif any(k in name for k in ['chair', 'seat', 'stool']): new_id = 5
+        elif any(k in name for k in ['sofa', 'couch']): new_id = 6
+        elif 'table' in name: new_id = 7
+        elif 'door' in name: new_id = 8
+        elif 'window' in name: new_id = 9
+        elif 'bookshelf' in name: new_id = 10
+        elif any(k in name for k in ['picture', 'painting', 'poster', 'frame']): new_id = 11
+        elif 'counter' in name: new_id = 12
+        elif any(k in name for k in ['blinds', 'shade']): new_id = 13
+        elif 'desk' in name: new_id = 14
+        elif any(k in name for k in ['shelves', 'shelf']): new_id = 15
+        elif 'curtain' in name and 'shower' not in name: new_id = 16
+        elif any(k in name for k in ['dresser', 'wardrobe']): new_id = 17
+        elif 'pillow' in name: new_id = 18
+        elif 'mirror' in name: new_id = 19
+        elif any(k in name for k in ['mat', 'rug', 'carpet']): new_id = 20
+        elif any(k in name for k in ['clothes', 'clothing', 'garment']): new_id = 21
+        elif 'ceiling' in name: new_id = 22
+        elif 'book' in name and 'shelf' not in name: new_id = 23
+        elif any(k in name for k in ['refrigerator', 'fridge', 'refridgerator']): new_id = 24
+        elif any(k in name for k in ['television', 'tv']): new_id = 25
+        elif 'paper' in name and 'towel' not in name: new_id = 26
+        elif 'towel' in name and 'paper' not in name and 'shower' not in name: new_id = 27
+        elif 'shower curtain' in name: new_id = 28
+        elif 'box' in name: new_id = 29
+        elif 'whiteboard' in name: new_id = 30
+        elif 'person' in name: new_id = 31
+        elif any(k in name for k in ['night stand', 'nightstand']): new_id = 32
+        elif 'toilet' in name: new_id = 33
+        elif 'sink' in name: new_id = 34
+        elif 'lamp' in name: new_id = 35
+        elif 'bathtub' in name: new_id = 36
+        elif 'bag' in name: new_id = 37
+        elif any(k in name for k in ['stairs', 'railing', 'column', 'pipe', 'beam', 'support']): new_id = 38
+        elif any(k in name for k in ['furniture', 'stand', 'ottoman']): new_id = 39
+        elif name in ['void', 'unknown', 'none', '']: new_id = 0
+        
         mapping[old_id] = new_id
         
-    print("Mapping and saving...")
+    return mapping
+
+def map_labels(dataset_root, names_file):
+    label_dir = os.path.join(dataset_root, 'all_data/label')
+    out_dir = os.path.join(dataset_root, 'all_data/label_40')
+    os.makedirs(out_dir, exist_ok=True)
+    
+    if not os.path.exists(names_file):
+        raise FileNotFoundError(f"Names file {names_file} not found. Run extraction script first.")
+        
+    with open(names_file, 'r') as f:
+        names = json.load(f)
+    
+    mapping = get_standard_mapping(names)
+    
+    files = sorted(os.listdir(label_dir))
+    print(f"Mapping {len(files)} labels using semantic dictionary...")
+    
     for f in tqdm(files):
-        path = os.path.join(label_dir, f)
-        lbl = np.array(Image.open(path))
+        img_path = os.path.join(label_dir, f)
+        lbl = np.array(Image.open(img_path))
         
-        # Clip to max_val to be safe
-        lbl[lbl >= max_val] = 0
+        # Apply mapping
+        # Label can be up to 894, mapping size is 895
+        mapped_lbl = mapping[lbl.astype(np.int32)]
         
-        new_lbl = mapping[lbl]
-        Image.fromarray(new_lbl).save(os.path.join(out_dir, f))
+        Image.fromarray(mapped_lbl).save(os.path.join(out_dir, f))
         
-    print(f"Saved mapped labels to {out_dir}")
+    print(f"Success! Corrected labels saved to {out_dir}")
 
 if __name__ == "__main__":
-    map_labels("/home/yy/deepsemanticseg-test/database/nyuv2/all_data")
+    # Correction: Use the correct dataset path provided by User
+    dataset_dir = "/media/yy/YY2号/deepDatasets/database/nyuv2"
+    names_json = "nyu894_names.json"
+    map_labels(dataset_dir, names_json)
