@@ -149,6 +149,13 @@ class HyDEncoder(nn.Module):
         # RGB x has 256 channels, Depth d4 has d_chans[3]=64 channels (wait, d_chans[3] is 64 here)
         self.fuse4 = MambaFusion(embed_dims[3], d_chans[3])
         
+        # --- PGI (Progressive Geometric Injection) Scale Parameters ---
+        # Initialize to 0 so that at epoch 0, the backbone is identical to pre-trained weights
+        self.inject_scale1 = nn.Parameter(torch.zeros(1))
+        self.inject_scale2 = nn.Parameter(torch.zeros(1))
+        self.inject_scale3 = nn.Parameter(torch.zeros(1))
+        self.inject_scale4 = nn.Parameter(torch.zeros(1))
+        
     def forward(self, rgb, depth):
         outputs = []
         
@@ -184,13 +191,15 @@ class HyDEncoder(nn.Module):
         
         # Layer 1 of self.stage1_blocks
         x = self.stage1_blocks[0](x) # /4
-        x_f1 = self.fuse1(x, d1)
-        outputs.append(x_f1)
+        fused1 = self.fuse1(x, d1)
+        x = x + self.inject_scale1 * fused1 # PGI Residual Injection
+        outputs.append(fused1) # Use fused feature for decoder
         
         x = self.stage1_blocks[1](x) # /8
         x = self.stage2_blocks(x)    # /8
-        x_f2 = self.fuse2(x, d2)
-        outputs.append(x_f2)
+        fused2 = self.fuse2(x, d2)
+        x = x + self.inject_scale2 * fused2 # PGI Residual Injection
+        outputs.append(fused2)
         
         # Bridge to Stage 3
         x = self.bridge_3(x) 
@@ -198,14 +207,16 @@ class HyDEncoder(nn.Module):
         # Stage 3
         x = self.stage3_down(x) # /16
         x = self.stage3_blocks(x)
-        x_f3 = self.fuse3(x, d3)
-        outputs.append(x_f3)
+        fused3 = self.fuse3(x, d3)
+        x = x + self.inject_scale3 * fused3 # PGI Residual Injection
+        outputs.append(fused3)
         
         # Stage 4
         x = self.stage4_down(x) # /32
         x = self.stage4_blocks(x)
-        x_f4 = self.fuse4(x, d4)
-        outputs.append(x_f4)
+        fused4 = self.fuse4(x, d4)
+        x = x + self.inject_scale4 * fused4 # PGI Residual Injection
+        outputs.append(fused4)
         
         return outputs
 

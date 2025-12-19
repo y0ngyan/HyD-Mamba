@@ -2,7 +2,7 @@
     "model_name": "hyd_mamba_nyuv2",
     "inputs": "rgbd",
     "dataset": "nyuv2",
-    "root": "/media/yy/YY2号/deepDatasets/database/nyuv2",
+    "root": "/home/yy/deepsemanticseg-test/database/nyuv2",
     "n_classes": 41,
     "id_unlabel": 0,
     "class_weight": "enet",
@@ -17,5 +17,6 @@
     "lr_power": 0.9,
     "epochs": 500,
     "freeze_backbone_epochs": 5,
-    "loss": "detail_aggregate"
+    "loss": "detail_aggregate",
+    "mamba_ckpt": "/home/yy/deepsemanticseg-test/pre-trained/vmamba-tiny/vssm1_tiny_0230s_ckpt_epoch_264.pth"
 }

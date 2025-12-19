@@ -106,8 +106,8 @@ def train(cfg_path):
     model = HyDNet(num_classes=cfg['n_classes'])
     
     # --- Weight Grafting (v2.2) ---
-    mamba_ckpt = "/home/yy/deepsemanticseg-test/pre-trained/vmamba-tiny/vssm1_tiny_0230s_ckpt_epoch_264.pth"
-    if hasattr(model.encoder, 'load_grafted_weights'):
+    mamba_ckpt = cfg.get('mamba_ckpt')
+    if mamba_ckpt and hasattr(model.encoder, 'load_grafted_weights'):
         model.encoder.load_grafted_weights(mamba_ckpt)
     
     model = model.to(device)

@@ -1,4 +1,4 @@
-# G-HyD-Mamba V2.3 网络架构文档
+# G-HyD-Mamba V2.5 (PGI) 网络架构文档
 
 ## 1. 概述 (Overview)
 
@@ -6,16 +6,14 @@
 
 ### 1.1 设计目标升级
 
-| 目标 | V2.3 解决方案 |
+| 目标 | V2.5 (PGI) 解决方案 |
 |------|----------|
 | 实时运行 (Jetson Orin) | 采用 Mamba 算子 + 精简 Stage 4 深度流 |
 | 适应高度/光照变化 | SIDE 预处理 + 全局 Normalization 补齐 |
 | 极小障碍物检测 | Top-Down FPN + 深度边缘引导 DuSA |
-| 快速稳定收敛 | 权重嫁接 (Grafted) + 强化版 AuxLoss |
+| 深度交互且保护主干 | **PGI (Progressive Geometric Injection)** |
 
 ---
-
-## 2. 网络架构总览 (V2.3)
 
 ```mermaid
 graph TD
@@ -23,20 +21,29 @@ graph TD
     Depth[Depth Map] --> SIDE[SIDE Preprocess]
     SIDE --> Depth_Stem[Depth Stem /2]
 
-    subgraph "Encoder (Hybrid Grafted)"
-        S1[Stage 1: CNN /4] --- F1[MambaFusion 1]
-        S2[Stage 2: CNN /8] --- F2[MambaFusion 2]
-        S3[Stage 3: Hybrid Mamba /16] --- F3[MambaFusion 3]
-        S4[Stage 4: Hybrid Mamba /32] --- F4[MambaFusion 4]
+    subgraph "Encoder (V2.5 PGI)"
+        S1[Stage 1: CNN /4] --> F1[MambaFusion 1]
+        S2[Stage 2: CNN /8] --> F2[MambaFusion 2]
+        S3[Stage 3: Hybrid Mamba /16] --> F3[MambaFusion 3]
+        S4[Stage 4: Hybrid Mamba /32] --> F4[MambaFusion 4]
         
         DS1[D-Stage 1: Large Kernel]
         DS2[D-Stage 2: Large Kernel]
         DS3[D-Stage 3: Large Kernel]
         DS4["D-Stage 4: Conv-BN-ReLU s2"]
+
+        F1 -- "ResInject (α1)" --> S2
+        F2 -- "ResInject (α2)" --> S3
+        F3 -- "ResInject (α3)" --> S4
     end
 
-    RGB_Stem --> S1 --> S2 --> S3 --> S4
+    RGB_Stem --> S1
     Depth_Stem --> DS1 --> DS2 --> DS3 --> DS4
+
+    DS1 -. NRGM .-> F1
+    DS2 -. NRGM .-> F2
+    DS3 -. NRGM .-> F3
+    DS4 -. NRGM .-> F4
 
     subgraph "Decoder (Top-Down FPN)"
         F4 --> P4[P4 1/32]
@@ -69,10 +76,10 @@ graph TD
 - **位置**: 连接在 Stage 3 (1/16 尺度) 之后。
 - **作用**: 在训练初期为浅/中层提供直接的语义分类监督，由于权重设为 0.4，能显著缓解深层网络的优化负担，解决 NaN 问题。
 
-### 3.3 非对称重心嫁接 (Grafted Backbone)
 - **RGB 主流**: 
     - 前段：复用 **MobileNetV3** 小模型权重，处理局部纹理。
     - 后段：切片复用 **VMamba-Tiny** 权重，处理全局上下文。
+- **PGI 注入**: 每一个 Stage 后，融合特征通过一个可学习因子 $\alpha$ 残差注入主干流，$X = X + \alpha \cdot F_{fused}$。$\alpha$ 初始化为 0 以保护预训练特征。
 - **深度辅流**: 通道数全程为 RGB 的 1/4。Stage 4 简化为轻量卷积，减小冗余计算。
 
 ### 3.4 鲁棒约束损失 (Robust Loss)
@@ -92,10 +99,11 @@ graph TD
 
 ---
 
-## 5. 改进路线图回顾
 - [x] **V2.1**: 增加 Mamba 深度 + 深度引导 DuSA。
 - [x] **V2.2**: 重构 FPN 解码器 + 引入 AuxLoss。
 - [x] **V2.3**: 补齐 Normalization 一致性 + 完善初始化逻辑。
+- [x] **V2.4**: 探索 Reinjection 深度交互。
+- [x] **V2.5**: **正式发布 PGI (Progressive Geometric Injection)**。
 
 ---
 > [!NOTE]
