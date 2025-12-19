@@ -2,7 +2,7 @@
     "model_name": "hyd_mamba_nyuv2",
     "inputs": "rgbd",
     "dataset": "nyuv2",
-    "root": "/home/yy/deepsemanticseg-test/database/nyuv2",
+    "root": "/media/yy/YY2号/deepDatasets/database/nyuv2",
     "n_classes": 41,
     "id_unlabel": 0,
     "class_weight": "enet",
