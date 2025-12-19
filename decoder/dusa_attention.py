@@ -33,21 +33,43 @@ class SparseAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+class DepthEdgeExtractor(nn.Module):
+    """
+    Extract edges from depth map using Sobel operator.
+    Provides a geometry-based importance map for DuSA.
+    """
+    def __init__(self):
+        super().__init__()
+        # Sobel kernels (fixed, not learnable)
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+        
+    def forward(self, depth):
+        # depth: (B, 1, H, W)
+        edge_x = F.conv2d(depth, self.sobel_x, padding=1)
+        edge_y = F.conv2d(depth, self.sobel_y, padding=1)
+        edge = torch.sqrt(edge_x ** 2 + edge_y ** 2)
+        # Normalize to [0, 1]
+        edge = edge / (edge.max() + 1e-6)
+        return edge
+
 class DuSABlock(nn.Module):
     """
-    Dual-Stage Sparse Attention Block.
-    1. Estimate importance map (or use Depth Edge).
+    Dual-Stage Sparse Attention Block with Depth-Guided Top-K Selection.
+    1. Compute importance from RGB features + Depth edges (Sobel).
     2. Select Top-K pixels.
     3. Apply Attention on Top-K.
     4. Scatter + Residual.
     """
-    def __init__(self, dim, num_heads=8, topk_ratio=0.1, importance_ratio=4):
+    def __init__(self, dim, num_heads=8, topk_ratio=0.1, importance_ratio=4, use_depth_guide=True):
         super().__init__()
         self.dim = dim
         self.topk_ratio = topk_ratio
+        self.use_depth_guide = use_depth_guide
         
-        # Importance estimator (if no external guide provided, or to refine it)
-        # Squeeze-and-Excitation like or simple Conv
+        # Importance estimator from RGB features
         self.importance_net = nn.Sequential(
             nn.Conv2d(dim, dim // importance_ratio, 1),
             nn.ReLU(),
@@ -55,22 +77,31 @@ class DuSABlock(nn.Module):
             nn.Sigmoid()
         )
         
+        # Depth edge extractor (Sobel, no params)
+        if use_depth_guide:
+            self.depth_edge = DepthEdgeExtractor()
+        
         self.attn = SparseAttention(dim, num_heads=num_heads)
         self.gamma = nn.Parameter(torch.zeros(1)) # Zero init for residual
 
-    def forward(self, x, guide_map=None):
+    def forward(self, x, depth=None):
         # x: (B, C, H, W)
+        # depth: (B, 1, H, W) - Optional raw depth for edge computation
         B, C, H, W = x.shape
         N = H * W
         k = int(N * self.topk_ratio)
         
-        # 1. Calculate Importance
+        # 1. Calculate Importance from RGB features
         imp = self.importance_net(x) # (B, 1, H, W)
-        if guide_map is not None:
-            # guide_map should be (B, 1, H, W), e.g. edge map from depth
-            # Resize guide if needed
-            if guide_map.shape[-2:] != (H, W):
-                guide_map = F.interpolate(guide_map, size=(H, W), mode='bilinear', align_corners=False)
+        
+        # 2. Add Depth Edge as geometry-aware guidance
+        if self.use_depth_guide and depth is not None:
+            # Resize depth to feature size if needed
+            if depth.shape[-2:] != (H, W):
+                depth_resized = F.interpolate(depth, size=(H, W), mode='bilinear', align_corners=False)
+            else:
+                depth_resized = depth
+            guide_map = self.depth_edge(depth_resized)
             imp = imp + guide_map
             
         # 2. Select Top-K

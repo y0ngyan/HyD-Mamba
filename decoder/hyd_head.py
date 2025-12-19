@@ -37,8 +37,9 @@ class HyDHead(nn.Module):
         # 4. Classifier
         self.cls_seg = nn.Conv2d(embedding_dim, num_classes, 1)
 
-    def forward(self, inputs):
+    def forward(self, inputs, depth=None):
         # inputs: list of features [c1, c2, c3, c4] at different scales
+        # depth: (B, 1, H, W) raw depth for DuSA edge guidance
         
         # Unify channels
         projected = [layer(x) for layer, x in zip(self.linear_layers, inputs)]
@@ -55,9 +56,8 @@ class HyDHead(nn.Module):
         fused = torch.cat(upsampled, dim=1) # (B, 4*emb, H/4, W/4)
         fused = self.fuse_conv(fused) # (B, emb, H/4, W/4)
         
-        # Apply DuSA
-        # We can use the fused feature itself to compute importance
-        fused = self.dusa(fused) # Residual connection inside
+        # Apply DuSA with Depth-guided Top-K
+        fused = self.dusa(fused, depth=depth)
         
         # Logic output
         out = self.cls_seg(fused)

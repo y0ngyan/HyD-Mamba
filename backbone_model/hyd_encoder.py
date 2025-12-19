@@ -1,170 +1,163 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from .vmamba_layer import Permute, LayerNorm2d
+from .vmamba_layer import VSSBlock, LayerNorm2d
 from .parallel_hybrid import ParallelHybridBlock
+from .side import SIDE, NRGM
+from .large_kernel import LargeKernelBlock
 
-class ConvBNAct(nn.Module):
-    """Simple Convolution -> BN -> Activation block"""
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, groups=1, act_layer=nn.ReLU):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, groups=groups, bias=False)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.act = act_layer() if act_layer is not None else nn.Identity()
-
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
-
-class DepthStream(nn.Module):
+class MambaFusion(nn.Module):
     """
-    Shallow Geometry Extractor (Strictly 3 Conv layers).
-    Generates multi-scale edge features from just 3 layers by using strides.
-    Structure:
-    Input -> Conv1 (s2, /2) -> Conv2 (s2, /4) -> Conv3 (s2, /8)
-    For deeper requires (/16, /32), we pool the output of Conv3.
-    This satisfies "only contains 2-3 layers".
-    """
-    def __init__(self, in_channels=1, base_channels=16):
-        super().__init__()
-        # Layer 1: /2
-        self.conv1 = ConvBNAct(in_channels, base_channels, stride=2)
-        # Layer 2: /4
-        self.conv2 = ConvBNAct(base_channels, base_channels*2, stride=2)
-        # Layer 3: /8
-        self.conv3 = ConvBNAct(base_channels*2, base_channels*4, stride=2)
-        
-    def forward(self, x):
-        # x: H, W
-        c1 = self.conv1(x) # /2 (Not utilized in fusion usually, or for stage 0?)
-        c2 = self.conv2(c1) # /4 -> Fuse Stage 1
-        c3 = self.conv3(c2) # /8 -> Fuse Stage 2
-        
-        # For Stage 3 (/16) and Stage 4 (/32), we don't have layers (limit 3).
-        # We use simple pooling on c3.
-        c4 = F.avg_pool2d(c3, kernel_size=2, stride=2) # /16 -> Fuse Stage 3
-        c5 = F.avg_pool2d(c4, kernel_size=2, stride=2) # /32 -> Fuse Stage 4
-        
-        return [c2, c3, c4, c5] # Matching [Stage1, Stage2, Stage3, Stage4]
-
-class GGFM(nn.Module):
-    """
-    Geometry-Gated Fusion Module.
-    Uses depth features to gate RGB features.
+    Geometry-Aware Mamba Fusion
+    Structure: Concat(RGB, Depth) -> Linear -> VSSBlock
     """
     def __init__(self, rgb_dim, depth_dim):
         super().__init__()
-        self.depth_proj = nn.Sequential(
-            nn.Conv2d(depth_dim, rgb_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(rgb_dim),
-            nn.Sigmoid()
-        )
+        self.proj = nn.Conv2d(rgb_dim + depth_dim, rgb_dim, kernel_size=1, bias=False)
+        self.norm = LayerNorm2d(rgb_dim)
+        # Use VSSBlock for selective scanning fusion
+        self.mamba = VSSBlock(hidden_dim=rgb_dim, drop_path=0.0)
         
     def forward(self, rgb, depth):
-        # rgb: (B, C_rgb, H, W)
-        # depth: (B, C_depth, H, W)
-        
-        gate = self.depth_proj(depth)
-        # Enhance RGB where depth indicates importance (edges)
-        # F_out = F_rgb + F_rgb * Gate
-        return rgb + rgb * gate
+        # rgb: (B, C, H, W)
+        # depth: (B, C_d, H, W)
+        x = torch.cat([rgb, depth], dim=1)
+        x = self.proj(x)
+        x = self.norm(x)
+        x = x.permute(0, 2, 3, 1) # N H W C
+        x = self.mamba(x)
+        x = x.permute(0, 3, 1, 2) # N C H W
+        return x
 
 class HyDEncoder(nn.Module):
-    """
-    Asymmetric Encoder with Parallel CNN-Mamba and Shallow Depth Stream.
-    """
-    def __init__(self, in_chans_rgb=3, in_chans_depth=1, 
-                 dims=[32, 64, 128, 256], 
-                 # Depth channels determined by DepthStream structure: 16*2=32, 16*4=64...
-                 # Fixed to [32, 64, 64, 64] for simplicity below
-                 vss_depths=[2, 2], 
-                 d_state=16):
+    def __init__(self, 
+                 in_chans=3, 
+                 embed_dims=[64, 128, 256, 512], 
+                 drop_path_rate=0.2):
         super().__init__()
         
-        # --- Depth Stream (Shallow 3-Layer) ---
-        base_d = 16
-        self.depth_stream = DepthStream(in_channels=in_chans_depth, base_channels=base_d)
-        # Output channels:
-        # 0: c2 (/4) -> 32
-        # 1: c3 (/8) -> 64
-        # 2: c4 (/16) -> 64 (pooled)
-        # 3: c5 (/32) -> 64 (pooled)
-        depth_chans = [32, 64, 64, 64]
+        # --- Depth Preprocessing (SIDE) ---
+        self.side = SIDE()
         
-        # --- RGB Stream ---
-        self.fusions = nn.ModuleList()
-        
-        # Stem
+        # --- RGB Stream (Mix of CNN and Mamba) ---
         self.rgb_stem = nn.Sequential(
-            ConvBNAct(in_chans_rgb, dims[0]//2, stride=2),
-            ConvBNAct(dims[0]//2, dims[0])
-        ) 
+            nn.Conv2d(in_chans, embed_dims[0], 3, 2, 1, bias=False),
+            nn.BatchNorm2d(embed_dims[0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embed_dims[0], embed_dims[0], 3, 1, 1, bias=False),
+            nn.BatchNorm2d(embed_dims[0]),
+            nn.ReLU(inplace=True),
+        )
         
-        # Stage 1 (CNN, /4)
-        self.stage1 = nn.Sequential(
-             ConvBNAct(dims[0], dims[0], stride=2),
-             ConvBNAct(dims[0], dims[0])
+        # Stage 1 & 2: CNN (MobileNet-style or Simple Blocks)
+        # Here keeping it simple matching previous HyD-Mamba logic but cleaner
+        self.stage1_blocks = nn.Sequential(
+            nn.Conv2d(embed_dims[0], embed_dims[1], 3, 2, 1, bias=False),
+            nn.BatchNorm2d(embed_dims[1]),
+            nn.ReLU(inplace=True)
         )
-        self.fusions.append(GGFM(dims[0], depth_chans[0]))
-
-        # Stage 2 (CNN, /8)
-        self.stage2 = nn.Sequential(
-             ConvBNAct(dims[0], dims[1], stride=2),
-             ConvBNAct(dims[1], dims[1])
+        self.stage2_blocks = nn.Sequential(
+            nn.Conv2d(embed_dims[1], embed_dims[2], 3, 2, 1, bias=False),
+            nn.BatchNorm2d(embed_dims[2]),
+            nn.ReLU(inplace=True)
         )
-        self.fusions.append(GGFM(dims[1], depth_chans[1]))
-
-        # Stage 3 (Parallel Hybrid, /16)
-        self.stage3_down = ConvBNAct(dims[1], dims[2], stride=2)
-        # Parallel Hybrid Blocks
-        self.stage3_blocks = nn.Sequential(*[
-            ParallelHybridBlock(dim=dims[2], d_state=d_state)
-            for _ in range(vss_depths[0])
-        ])
-        self.fusions.append(GGFM(dims[2], depth_chans[2]))
-
-        # Stage 4 (Parallel Hybrid, /32)
-        self.stage4_down = ConvBNAct(dims[2], dims[3], stride=2)
-        self.stage4_blocks = nn.Sequential(*[
-            ParallelHybridBlock(dim=dims[3], d_state=d_state)
-            for _ in range(vss_depths[1])
-        ])
-        self.fusions.append(GGFM(dims[3], depth_chans[3]))
+        
+        # Stage 3 & 4: Parallel CNN-Mamba (Deeper: 2 blocks each for better global context)
+        self.stage3_down = nn.Conv2d(embed_dims[2], embed_dims[3], 3, 2, 1)
+        self.stage3_blocks = nn.Sequential(
+            ParallelHybridBlock(embed_dims[3]),
+            ParallelHybridBlock(embed_dims[3])
+        )
+        
+        # Stage 4
+        self.stage4_down = nn.Conv2d(embed_dims[3], embed_dims[3], 3, 2, 1) # Downsample
+        self.stage4_blocks = nn.Sequential(
+            ParallelHybridBlock(embed_dims[3]),
+            ParallelHybridBlock(embed_dims[3])
+        )
+        
+        # --- Depth Stream (Large Kernel) ---
+        # Channels 1/4 of RGB
+        d_chans = [c // 4 for c in embed_dims]
+        
+        # Depth Stem: SIDE outputs 1 channel, map to d_chans[0]
+        # Input depth resolution is H,W. RGB stem downsamples /2. 
+        # Depth Stream needs to match resolution? 
+        # HDBFormer suggests maintaining resolution or matching stages.
+        # We will match RGB stages.
+        self.depth_stem = nn.Sequential(
+            nn.Conv2d(1, d_chans[0], 3, 2, 1, bias=False), # /2
+            nn.BatchNorm2d(d_chans[0]),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.depth_stage1 = LargeKernelBlock(d_chans[0], d_chans[1], stride=2) # /4
+        self.depth_stage2 = LargeKernelBlock(d_chans[1], d_chans[2], stride=2) # /8
+        self.depth_stage3 = LargeKernelBlock(d_chans[2], d_chans[3], stride=2) # /16
+        self.depth_stage4 = LargeKernelBlock(d_chans[3], d_chans[3], stride=2) # /32
+        
+        # --- Fusion Modules (NRGM + MambaFusion) ---
+        self.nrgm = NRGM()
+        
+        # Fusion at Stage 1 (1/4 scale)
+        self.fuse1 = MambaFusion(embed_dims[1], d_chans[1])
+        # Fusion at Stage 2 (1/8 scale)
+        self.fuse2 = MambaFusion(embed_dims[2], d_chans[2])
+        # Fusion at Stage 3 (1/16 scale)
+        self.fuse3 = MambaFusion(embed_dims[3], d_chans[3])
+        # Fusion at Stage 4 (1/32 scale)
+        self.fuse4 = MambaFusion(embed_dims[3], d_chans[3])
         
     def forward(self, rgb, depth):
-        # 1. Forward Depth Stream
-        # Returns list of features at [1/4, 1/8, 1/16, 1/32]
-        d_feats = self.depth_stream(depth)
+        # rgb: (B, 3, H, W)
+        # depth: (B, 1, H, W) - Raw Depth
+        outputs = []
         
-        outs = []
+        # --- Depth Preprocessing ---
+        # 1. SIDE: Log + InstNorm
+        depth_side = self.side(depth)
         
-        # 2. Forward RGB Stream + Fusion
+        # --- Depth Stream Forward ---
+        d0 = self.depth_stem(depth_side) # /2
+        d1 = self.depth_stage1(d0)       # /4
+        d2 = self.depth_stage2(d1)       # /8
+        d3 = self.depth_stage3(d2)       # /16
+        d4 = self.depth_stage4(d3)       # /32
         
-        # Stem (/2)
-        x = self.rgb_stem(rgb)
+        # --- Apply NRGM ---
+        # Suppress noise using raw depth mask
+        # Note: raw depth needs to be downsampled to match d1, d2...
+        # We can pass raw_depth to NRGM and it will interpolate.
+        d1 = self.nrgm(d1, depth)
+        d2 = self.nrgm(d2, depth)
+        d3 = self.nrgm(d3, depth)
+        d4 = self.nrgm(d4, depth)
         
-        # Stage 1 (/4)
-        x = self.stage1(x)
-        x = self.fusions[0](x, d_feats[0])
-        outs.append(x)
+        # --- RGB Stream & Fusion ---
+        x = self.rgb_stem(rgb) # /2
         
-        # Stage 2 (/8)
-        x = self.stage2(x)
-        x = self.fusions[1](x, d_feats[1])
-        outs.append(x)
+        # Stage 1
+        x = self.stage1_blocks(x) # /4
+        x = self.fuse1(x, d1)
+        outputs.append(x)
         
-        # Stage 3 (/16) - Parallel Hybrid
-        x = self.stage3_down(x)
+        # Stage 2
+        x = self.stage2_blocks(x) # /8
+        x = self.fuse2(x, d2)
+        outputs.append(x)
+        
+        # Stage 3
+        x = self.stage3_down(x) # /16
         x = self.stage3_blocks(x)
-        x = self.fusions[2](x, d_feats[2])
-        outs.append(x)
+        x = self.fuse3(x, d3)
+        outputs.append(x)
         
-        # Stage 4 (/32) - Parallel Hybrid
-        x = self.stage4_down(x)
+        # Stage 4
+        x = self.stage4_down(x) # /32
         x = self.stage4_blocks(x)
-        x = self.fusions[3](x, d_feats[3])
-        outs.append(x)
+        x = self.fuse4(x, d4)
+        outputs.append(x)
         
-        return outs
+        return outputs
 
 if __name__ == "__main__":
     print("Testing HyDEncoder...")
