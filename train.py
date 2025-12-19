@@ -145,6 +145,11 @@ def train(cfg_path):
     global_step = 0
     training_history = {'train_loss': [], 'val_miou': [], 'lr': [], 'grad_norm': []}
     
+    # 10. Gradient Accumulation
+    accumulation_steps = cfg.get('accumulation_steps', 1)  # Default no accumulation
+    effective_batch_size = cfg['ims_per_gpu'] * accumulation_steps
+    print(f"Gradient Accumulation: {accumulation_steps} steps (effective batch size: {effective_batch_size})")
+    
     for epoch in range(cfg['epochs']):
         model.train()
         epoch_loss = 0
@@ -152,13 +157,12 @@ def train(cfg_path):
         epoch_start = time.time()
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['epochs']}")
+        optimizer.zero_grad()  # Zero gradients at epoch start
         
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             images = batch['image'].to(device)
             depths = batch['depth'].to(device)
             labels = batch['label'].to(device)
-            
-            optimizer.zero_grad()
             
             # Mixed Precision Forward
             with autocast():
@@ -168,33 +172,37 @@ def train(cfg_path):
                     outputs = nn.functional.interpolate(outputs, size=labels.shape[-2:], mode='bilinear', align_corners=False)
                     
                 loss = criterion(outputs, labels)
+                loss = loss / accumulation_steps  # Scale loss for accumulation
             
-            # Mixed Precision Backward
+            # Mixed Precision Backward (accumulate gradients)
             scaler.scale(loss).backward()
             
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            # Only update weights every accumulation_steps
+            if (batch_idx + 1) % accumulation_steps == 0:
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                
+                # Record gradient norm
+                grad_norm = get_grad_norm(model)
+                epoch_grad_norms.append(grad_norm)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()  # Reset gradients after update
+                
+                # EMA update
+                ema.update(model)
+                
+                global_step += 1
+                
+                # Log per-step metrics (every 10 actual updates)
+                if global_step % 10 == 0:
+                    writer.add_scalar('Train/Loss_step', loss.item() * accumulation_steps, global_step)
+                    writer.add_scalar('Train/GradNorm_step', grad_norm, global_step)
             
-            # Record gradient norm
-            grad_norm = get_grad_norm(model)
-            epoch_grad_norms.append(grad_norm)
-            
-            scaler.step(optimizer)
-            scaler.update()
-            
-            # EMA update
-            ema.update(model)
-            
-            epoch_loss += loss.item()
-            global_step += 1
-            
-            # Log per-step metrics (every 10 steps)
-            if global_step % 10 == 0:
-                writer.add_scalar('Train/Loss_step', loss.item(), global_step)
-                writer.add_scalar('Train/GradNorm_step', grad_norm, global_step)
-            
-            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'grad': f'{grad_norm:.2f}'})
+            epoch_loss += loss.item() * accumulation_steps  # Unscale for logging
+            pbar.set_postfix({'loss': f'{loss.item() * accumulation_steps:.4f}', 'acc': f'{(batch_idx+1) % accumulation_steps + 1}/{accumulation_steps}'})
         
         # Epoch metrics
         epoch_time = time.time() - epoch_start

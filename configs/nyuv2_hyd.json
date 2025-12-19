@@ -9,6 +9,7 @@
     "scales_range": "0.5 2.0",
     "crop_size": "480 640",
     "ims_per_gpu": 2,
+    "accumulation_steps": 2,
     "num_workers": 2,
     "lr_start": 5e-4,
     "momentum": 0.9,
